@@ -21,16 +21,28 @@ import {apiUrl, apiUrlWithoutTenants, basePath} from "override/utils/route"
 import {useMiscStore} from "override/stores/misc"
 
 import * as Utils from "../utils/utils"
+import {validationErrorLines, type ValidationError} from "../utils/validationErrors"
 import {routeFamily} from "../utils/routeFamily"
 
 import type {Dashboard, Chart, DashboardSettings} from "../components/dashboard/types.ts"
-import {ChartFiltersOverrides, useClient} from "@kestra-io/kestra-sdk"
+import {useClient, type ChartFiltersOverrides} from "@kestra-io/kestra-sdk"
 import * as DashboardsAPI from "@kestra-io/kestra-sdk/dashboards"
-import {removeRefPrefix, usePluginsStore} from "./plugins"
+import {removeRefPrefix, usePluginsStore, type JsonSchemaDef, type RootJsonSchema} from "./plugins"
 import * as YAML_UTILS from "@kestra-io/topology/flow-yaml-utils"
 import {useUnsavedChangesStore} from "./unsavedChanges"
 import {useBookmarksStore} from "./bookmarks"
-import {RouteLocation} from "vue-router"
+import type {RouteLocation} from "vue-router"
+import type {KestraHttpError} from "../utils/kestraHttp"
+
+type ParsedDashboardSource = {id?: string} & Record<string, unknown>
+type DashboardListOptions = Omit<NonNullable<Parameters<typeof DashboardsAPI.searchDashboards>[0]>, "sort"> & {sort?: string}
+type LoadedChart = Chart & {raw: Chart}
+
+interface LoadChartResult {
+    error: string | null;
+    data: LoadedChart | null;
+    raw: Record<string, unknown>;
+}
 
 export const DEFAULT_DASHBOARD = {
     id: "default",
@@ -55,9 +67,9 @@ export const useDashboardStore = defineStore("dashboard", () => {
 
     const sourceCode = ref("")
     const sourceCodeOrigin = ref("")
-    const parsedSource = computed<{ id?: string, [key:string]: any } | undefined>((previous) => {
+    const parsedSource = computed<ParsedDashboardSource | undefined>((previous) => {
         try {
-            return YAML_UTILS.parse(sourceCode.value)
+            return YAML_UTILS.parse(sourceCode.value) as ParsedDashboardSource
         } catch {
             return previous
         }
@@ -73,7 +85,7 @@ export const useDashboardStore = defineStore("dashboard", () => {
 
     const axios = useClient()
 
-    async function list(options: Record<string, any>, route: RouteLocation): Promise<{ id: string; title: string; isDefault: boolean }[]> {
+    async function list(options: DashboardListOptions, route: RouteLocation): Promise<{ id: string; title: string; isDefault: boolean }[]> {
         const {sort, ...params} = options
         const res = await DashboardsAPI.searchDashboards({...params, size: 100, sort: sort ? [sort] : undefined})
         await loadDefaults()
@@ -232,6 +244,8 @@ export const useDashboardStore = defineStore("dashboard", () => {
         activeDashboard.value = data
         sourceCode.value = data.sourceCode ?? ""
         sourceCodeOrigin.value = sourceCode.value
+        latestValidation++
+        setValidationErrors(undefined)
 
         return activeDashboard.value
     }
@@ -265,24 +279,39 @@ export const useDashboardStore = defineStore("dashboard", () => {
         return deleted
     }
 
+    let latestValidation = 0
+
     async function validateDashboard(source: Dashboard["sourceCode"]) {
-        const {data} = await axios.post(`${apiUrl()}/dashboards/validate`, source ?? "", yaml)
-        return data
+        const validation = ++latestValidation
+        // A response overtaken by a newer validation describes a source the editor no longer holds.
+        const isLatest = () => validation === latestValidation
+        try {
+            const {data} = await axios.post(`${apiUrl()}/dashboards/validate`, source ?? "", yaml)
+            if (isLatest()) {
+                setValidationErrors(data.errors)
+            }
+            return data
+        } catch (error) {
+            if (isLatest()) {
+                setValidationErrors(undefined)
+            }
+            throw error
+        }
     }
 
     async function generate(id: Dashboard["id"], chartId: Chart["id"], parameters: ChartFiltersOverrides) {
         try {
             const {data} = await axios.post(`${apiUrl()}/dashboards/${id}/charts/${chartId}`, parameters, {showMessageOnError: false} as AxiosLikeConfig)
             return data
-        } catch (e: any) {
-            if (e.status === 404) return undefined
+        } catch (e: unknown) {
+            if ((e as KestraHttpError).status === 404) return undefined
             throw e
         }
     }
 
     async function validateChart(source: string) {
         const {data} = await axios.post(`${apiUrl()}/dashboards/validate/chart`, source, yaml)
-        chartErrors.value = data.constraints ? [data.constraints] : []
+        chartErrors.value = validationErrorLines(data.errors)
         return data
     }
 
@@ -307,36 +336,33 @@ export const useDashboardStore = defineStore("dashboard", () => {
 
     const pluginsStore = usePluginsStore()
 
-    const InitialSchema = {}
+    const InitialSchema = {definitions: {}, $ref: ""}
 
-    const schema = computed<{
-            definitions: any,
-            $ref: string,
-    }>(() =>  {
+    const schema = computed<RootJsonSchema>(() =>  {
         return pluginsStore.schemaType?.dashboard ?? InitialSchema
     })
 
-    const definitions = computed<Record<string, any>>(() =>  {
+    const definitions = computed<Record<string, JsonSchemaDef>>(() =>  {
         return schema.value.definitions ?? {}
     })
 
-    function recursivelyLoopUpSchemaRef(a: any, defs: Record<string, any>): any {
-        if (a.$ref) {
-            const refKey = removeRefPrefix(a.$ref)
+    function recursivelyLoopUpSchemaRef(schemaValue: JsonSchemaDef | undefined, defs: Record<string, JsonSchemaDef>): JsonSchemaDef | undefined {
+        if (schemaValue?.$ref) {
+            const refKey = removeRefPrefix(schemaValue.$ref)
             return recursivelyLoopUpSchemaRef(defs[refKey], defs)
         }
-        return a
+        return schemaValue
     }
 
-    const rootSchema = computed<Record<string, any> | undefined>(() => {
+    const rootSchema = computed<JsonSchemaDef | undefined>(() => {
         return recursivelyLoopUpSchemaRef(schema.value, definitions.value)
     })
 
-    const rootProperties = computed<Record<string, any> | undefined>(() => {
+    const rootProperties = computed<Record<string, JsonSchemaDef> | undefined>(() => {
         return rootSchema.value?.properties
     })
 
-    async function loadChart(chart: any) {
+    async function loadChart(chart: Chart): Promise<LoadChartResult> {
         const yamlChart = YAML_UTILS.stringify(chart)
         if(selectedChart.value?.content === yamlChart){
             return {
@@ -345,34 +371,28 @@ export const useDashboardStore = defineStore("dashboard", () => {
                 raw: chart,
             }
         }
-        const result: { error: string | null; data: null | {
-            id?: string;
-            name?: string;
-            type?: string;
-            chartOptions?: Record<string, any>;
-            dataFilters?: any[];
-            charts?: any[];
-        }; raw: any } = {
+        const result: LoadChartResult = {
             error: null,
             data: null,
             raw: {},
         }
         const errors = await validateChart(yamlChart)
 
-        if (errors.constraints) {
-            result.error = errors.constraints
+        const errorLines = validationErrorLines(errors.errors)
+        if (errorLines.length) {
+            result.error = errorLines.join("\n")
         } else {
             result.data = {...chart, content: yamlChart, raw: chart}
         }
 
-        selectedChart.value = typeof result.data === "object"
+        selectedChart.value = result.data
             ? {
                 ...result.data,
                 chartOptions: {
-                    ...result.data?.chartOptions,
+                    ...result.data.chartOptions,
                     width: 12,
                 },
-            } as any
+            }
             : undefined
         chartErrors.value = [result.error].filter(e => e !== null)
 
@@ -380,6 +400,13 @@ export const useDashboardStore = defineStore("dashboard", () => {
     }
 
     const errors = ref<string[] | undefined>()
+    const validationErrors = ref<ValidationError[]>()
+
+    function setValidationErrors(located: ValidationError[] | undefined) {
+        validationErrors.value = located
+        const lines = validationErrorLines(located)
+        errors.value = lines.length ? lines : undefined
+    }
 
     return {
         activeDashboard,
@@ -407,6 +434,7 @@ export const useDashboardStore = defineStore("dashboard", () => {
         export: exportDashboard,
         loadChart,
         errors,
+        validationErrors,
 
         schema,
         definitions,
